@@ -37,7 +37,7 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
       - run: pip install semgrep
-      - run: semgrep scan --config p/python --config p/owasp-top-ten --error app
+      - run: semgrep scan --config p/python --config p/owasp-top-ten --error app.py
 
   bandit:
     name: Bandit (SAST Python)
@@ -48,7 +48,7 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
       - run: pip install bandit
-      - run: bandit -r app -ll
+      - run: bandit -r app.py -ll
 
   hadolint:
     name: Hadolint (Lint Dockerfile)
@@ -69,7 +69,7 @@ jobs:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
       - run: pip install -r requirements-dev.txt
-      - run: pylint app tests --fail-under=9.0
+      - run: pylint app.py test_app.py --fail-under=9.0
 
   pip-audit:
     name: pip-audit (CVE Dependency)
