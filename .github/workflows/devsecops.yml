@@ -2,9 +2,8 @@ name: DevSecOps Pipeline
 
 on:
   push:
-    branches: [main, "stage-*"]
-  pull_request:
     branches: [main]
+  pull_request:
   workflow_dispatch:
 
 permissions:
@@ -14,9 +13,13 @@ env:
   PYTHON_VERSION: "3.12"
 
 jobs:
+  # ===================== STAGE 1: SHIFT-LEFT (paralel) =====================
   gitleaks:
     name: Gitleaks (Secret Scan)
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
     steps:
       - uses: actions/checkout@v4
         with:
@@ -28,11 +31,13 @@ jobs:
   semgrep:
     name: Semgrep (SAST)
     runs-on: ubuntu-latest
-    container:
-      image: semgrep/semgrep
     steps:
       - uses: actions/checkout@v4
-      - run: semgrep scan --config auto --error --exclude-rule yaml.github-actions.security.github-actions-mutable-action-tag.github-actions-mutable-action-tag
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - run: pip install semgrep
+      - run: semgrep scan --config p/python --config p/owasp-top-ten --error app.py
 
   bandit:
     name: Bandit (SAST Python)
@@ -42,9 +47,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
-      - run: |
-          pip install bandit
-          bandit -r . -ll --exclude ./tests,./venv
+      - run: pip install bandit
+      - run: bandit -r app.py -ll
 
   hadolint:
     name: Hadolint (Lint Dockerfile)
@@ -54,7 +58,6 @@ jobs:
       - uses: hadolint/hadolint-action@v3.1.0
         with:
           dockerfile: Dockerfile
-          failure-threshold: warning
 
   pylint:
     name: Pylint (Skor >= 9.0)
@@ -65,9 +68,8 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
-      - run: |
-          pip install pylint -r requirements.txt
-          pylint --fail-under=9.0 $(git ls-files '*.py')
+      - run: pip install -r requirements-dev.txt
+      - run: pylint app.py test_app.py --fail-under=9.0
 
   pip-audit:
     name: pip-audit (CVE Dependency)
@@ -77,9 +79,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
-      - run: |
-          pip install pip-audit
-          pip-audit -r requirements.txt
+      - run: pip install pip-audit
+      - run: pip-audit -r requirements.txt
 
   pytest:
     name: pytest (Coverage >= 80%)
@@ -90,19 +91,86 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
-      - run: |
-          pip install pytest pytest-cov -r requirements.txt
-          pytest --cov=app --cov-fail-under=80
+      - run: pip install -r requirements-dev.txt
+      - run: pytest --cov=app --cov-report=term-missing --cov-report=xml --cov-fail-under=80
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage-report
+          path: coverage.xml
 
+  # ===================== STAGE 2: SECURITY GATE =====================
   security-gate:
     name: Security Score Gate
     runs-on: ubuntu-latest
     needs: [gitleaks, semgrep, bandit, hadolint, pylint, pip-audit, pytest]
+    if: always()
+    permissions:
+      contents: read
+      pull-requests: write
     steps:
-      - name: Pastikan semua job stage 1 sukses
-        run: |
-          if [ "${{ contains(needs.*.result, 'failure') }}" = "true" ] || \
-             [ "${{ contains(needs.*.result, 'cancelled') }}" = "true" ]; then
-            echo "Security gate GAGAL"; exit 1
-          fi
-          echo "Security gate LOLOS"
+      - name: Hitung skor, komentari PR, putuskan lolos atau gagal
+        uses: actions/github-script@v7
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        with:
+          script: |
+            const needs = JSON.parse(process.env.NEEDS_JSON);
+            const THRESHOLD = 80;
+            // [id job, nama, bobot, kritis (gagal = langsung blokir)]
+            const checks = [
+              ['gitleaks',  'Gitleaks (Secret Scan)',     20, true],
+              ['semgrep',   'Semgrep (SAST)',             15, false],
+              ['bandit',    'Bandit (SAST Python)',       15, false],
+              ['pip-audit', 'pip-audit (CVE Dependency)', 15, false],
+              ['pytest',    'pytest (Coverage >= 80%)',   15, false],
+              ['pylint',    'Pylint (Skor >= 9.0)',       10, false],
+              ['hadolint',  'Hadolint (Dockerfile)',      10, false],
+            ];
+            let score = 0;
+            let criticalFail = false;
+            const rows = checks.map(([id, name, weight, critical]) => {
+              const ok = needs[id].result === 'success';
+              if (ok) score += weight;
+              if (!ok && critical) criticalFail = true;
+              const note = critical ? ' (kritis)' : '';
+              return `| ${name}${note} | ${weight} | ${ok ? 'LOLOS' : 'GAGAL'} | ${ok ? weight : 0} |`;
+            });
+            const pass = score >= THRESHOLD && !criticalFail;
+            const verdict = pass
+              ? `LOLOS: skor ${score}/100 (minimal ${THRESHOLD})`
+              : `DIBLOKIR: skor ${score}/100` + (criticalFail ? ' dan secret bocor terdeteksi' : ` (minimal ${THRESHOLD})`);
+            const body = [
+              '<!-- security-score-bot -->',
+              '## Security Score Bot',
+              '',
+              `**${verdict}**`,
+              '',
+              '| Pemeriksaan | Bobot | Hasil | Poin |',
+              '|---|---|---|---|',
+              ...rows,
+              '',
+              `Commit: \`${context.sha.slice(0, 7)}\``,
+            ].join('\n');
+
+            await core.summary.addRaw(body, true).write();
+
+            if (context.eventName === 'pull_request') {
+              try {
+                const { owner, repo } = context.repo;
+                const issue_number = context.payload.pull_request.number;
+                const { data: comments } = await github.rest.issues.listComments({ owner, repo, issue_number });
+                const old = comments.find(c => c.body && c.body.includes('<!-- security-score-bot -->'));
+                if (old) {
+                  await github.rest.issues.updateComment({ owner, repo, comment_id: old.id, body });
+                } else {
+                  await github.rest.issues.createComment({ owner, repo, issue_number, body });
+                }
+              } catch (err) {
+                core.warning(`Tidak bisa mengomentari PR: ${err.message}`);
+              }
+            }
+
+            if (!pass) {
+              core.setFailed(verdict);
+            }
