@@ -266,3 +266,149 @@ jobs:
           DIGEST="${IMAGE}@${HASH}"
           cosign sign --yes "${DIGEST}"
           echo "Image bertanda tangan: ${DIGEST}" >> "$GITHUB_STEP_SUMMARY"
+
+
+     # ===================== STAGE 4: DEPLOY AMAN (self-hosted runner) =====================
+  stage4-precheck:
+    name: Cek Kesiapan VM
+    runs-on: ubuntu-latest
+    needs: [cosign-sign]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    outputs:
+      ready: ${{ steps.check.outputs.ready }}
+    steps:
+      - id: check
+        env:
+          ENABLED: ${{ vars.STAGE4_ENABLED }}
+        run: |
+          if [ "$ENABLED" = "true" ]; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+            echo "Stage 4 aktif, deploy dijalankan lewat self-hosted runner." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "STAGE4_ENABLED belum true, Stage 4 dilewati." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  deploy-staging:
+    name: Deploy Staging
+    runs-on: [self-hosted, linux, deploy]
+    needs: [stage4-precheck]
+    if: needs.stage4-precheck.outputs.ready == 'true'
+    environment: staging
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: sigstore/cosign-installer@v3
+      - name: Login registry
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: printf '%s' "$GH_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+      - name: Verifikasi tanda tangan image (Cosign)
+        run: |
+          IMAGE="ghcr.io/${GITHUB_REPOSITORY,,}:${GITHUB_SHA}"
+          cosign verify "${IMAGE}" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            --certificate-identity-regexp "^https://github.com/${GITHUB_REPOSITORY}/.github/workflows/devsecops.yml@refs/heads/main$" \
+            > /dev/null
+          echo "Tanda tangan image terverifikasi." >> "$GITHUB_STEP_SUMMARY"
+      - name: Deploy container staging (port 8081)
+        run: |
+          IMAGE="ghcr.io/${GITHUB_REPOSITORY,,}:${GITHUB_SHA}"
+          docker pull "${IMAGE}"
+          docker rm -f pipline-staging >/dev/null 2>&1 || true
+          docker run -d --name pipline-staging --restart unless-stopped -p 8081:8000 "${IMAGE}"
+      - name: Health check staging
+        run: |
+          for i in $(seq 1 10); do
+            if curl -fsS "http://localhost:8081/health"; then
+              echo "Staging sehat." >> "$GITHUB_STEP_SUMMARY"; exit 0
+            fi
+            sleep 3
+          done
+          echo "Staging tidak sehat." >> "$GITHUB_STEP_SUMMARY"; exit 1
+
+  zap-dast:
+    name: OWASP ZAP (DAST Staging)
+    runs-on: [self-hosted, linux, deploy]
+    needs: [deploy-staging]
+    steps:
+      - name: Scan baseline ke staging
+        run: |
+          mkdir -p zap-out && chmod 777 zap-out
+          docker run --rm --network host -v "$(pwd)/zap-out:/zap/wrk/:rw" -t ghcr.io/zaproxy/zaproxy:stable \
+            zap-baseline.py -t "http://localhost:8081" -r zap-report.html -I
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: zap-report
+          path: zap-out/zap-report.html
+
+  deploy-production:
+    name: Deploy Production
+    runs-on: [self-hosted, linux, deploy]
+    needs: [zap-dast]
+    environment: production
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Login registry
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: printf '%s' "$GH_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+      - name: Catat image production saat ini (untuk rollback)
+        id: prev
+        run: |
+          PREV=$(docker inspect --format='{{.Config.Image}}' pipline-prod 2>/dev/null || true)
+          echo "image=${PREV}" >> "$GITHUB_OUTPUT"
+          echo "Image sebelumnya: ${PREV:-tidak ada}" >> "$GITHUB_STEP_SUMMARY"
+      - name: Deploy container production (port 8080)
+        run: |
+          IMAGE="ghcr.io/${GITHUB_REPOSITORY,,}:${GITHUB_SHA}"
+          docker pull "${IMAGE}"
+          docker rm -f pipline-prod >/dev/null 2>&1 || true
+          docker run -d --name pipline-prod --restart unless-stopped -p 8080:8000 "${IMAGE}"
+      - name: Health check production
+        id: health
+        run: |
+          for i in $(seq 1 10); do
+            if curl -fsS "http://localhost:8080/health"; then
+              echo "Production sehat." >> "$GITHUB_STEP_SUMMARY"; exit 0
+            fi
+            sleep 3
+          done
+          exit 1
+      - name: Auto-rollback ke image sebelumnya
+        if: failure() && steps.health.outcome == 'failure'
+        env:
+          PREV_IMAGE: ${{ steps.prev.outputs.image }}
+        run: |
+          docker rm -f pipline-prod >/dev/null 2>&1 || true
+          if [ -n "$PREV_IMAGE" ]; then
+            docker run -d --name pipline-prod --restart unless-stopped -p 8080:8000 "${PREV_IMAGE}"
+            echo "ROLLBACK ke ${PREV_IMAGE}" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Tidak ada image sebelumnya, container production dihentikan." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  notify-failure:
+    name: Notifikasi Gagal (GitHub Issue)
+    runs-on: ubuntu-latest
+    needs: [cosign-sign, deploy-staging, zap-dast, deploy-production]
+    if: failure() && github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const run = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `Pipeline gagal di main (${context.sha.slice(0, 7)})`,
+              body: `Stage Build atau Deploy gagal.\n\nRun: ${run}\nCommit: ${context.sha}\n\nPeriksa log, lalu perbaiki lewat Pull Request.`,
+              labels: [],
+            });
